@@ -1,147 +1,174 @@
-# 🚀 YOLOv5 + PyMAVLink real-time drone control
 import torch
 import cv2
 import numpy as np
 from pymavlink import mavutil
 import time
 
-# === CONFIGURATION ===
-YOLO_MODEL = 'C:/Users/nayak/Documents/Bullseye_Detection/yolov5/runs/train/bullseye_detector8/weights/best.pt'     # Or yolov5n.pt for nano model
-TARGET_CLASS = 'person'       # Class name to track
-CAMERA_SOURCE = 0             # 0=USB Cam, or RTSP/UDP URL e.g., 'udp://0.0.0.0:5600'
-MAVLINK_CONNECTION = 'tcp:127.0.0.1:5762'  # Or serial e.g., 'serial:/dev/serial0:115200'
-SPEED = 5                   # m/s forward speed
-KP_YAW = 0.005                # Proportional gain for yaw
-KP_ALT = 0.005                # Proportional gain for altitude
+YOLO_MODEL = 'C:/Users/nayak/Documents/Bullseye_Detection/yolov5/runs/train/bullseye_detector8/weights/best.pt'
+TARGET_CLASS = 'person'
+CAMERA_SOURCE = 0
+MAVLINK_CONNECTION = 'tcp:127.0.0.1:5762'  
+SPEED = 3                     
+KP_YAW = 1.5                   
+KP_ALT = 1                  
+TARGET_ALTITUDE = 15           
+MAVLINK_SIGN_KEY = b'supersecurekey1234'  
+SIGNING_ID = 1                            
 
-# === LOAD YOLOv5 MODEL ===
 print("[INFO] Loading YOLOv5 model...")
 model = torch.hub.load('ultralytics/yolov5', 'custom', YOLO_MODEL)
-model.conf = 0.4  # Confidence threshold
+model.conf = 0.4
 
-# === CONNECT TO AUTOPILOT ===
-print("[INFO] Connecting to MAVLink...")
-master = mavutil.mavlink_connection(MAVLINK_CONNECTION)
+print("[INFO] Connecting to MAVLink (MAVLink2)...")
+boot_time = time.time()
+master = mavutil.mavlink_connection(
+    MAVLINK_CONNECTION, baud=115200, source_system=1, mavlink20=True
+)
 master.wait_heartbeat()
-print(f"[INFO] Connected to system (system {master.target_system}, component {master.target_component})")
-print(f"[INFO] Connected to system (system {master.target_system}, component {master.target_component})")
+print(f"[INFO] Connected to system (sys {master.target_system}, comp {master.target_component})")
 
-# === SEND FAKE POSITION ESTIMATE FOR EKF INIT (SITL workaround) ===
+print("[INFO] Enabling MAVLink2 message signing...")
+master.signing = True
+master.signing_secret_key = MAVLINK_SIGN_KEY
+master.signing_link_id = SIGNING_ID
+master.signing_timestamp = int(time.time())
+print(f"[INFO] Message signing enabled with link_id={SIGNING_ID}")
+
 def send_fake_position_estimate():
     print("[INFO] Sending fake position estimates for EKF init...")
-    for i in range(50):  # send for ~5 seconds
+    for _ in range(50):  # 5 seconds
         master.mav.vision_position_estimate_send(
-            int(time.time() * 1e6),  # usec
-            0, 0, -1,                # x, y, z (NED, z negative up)
-            0, 0, 0                  # roll, pitch, yaw
+            int((time.time() - boot_time) * 1e6),  
+                                    0, 0, -1,               
+            0, 0, 0                  
         )
         time.sleep(0.1)
 
 send_fake_position_estimate()
 
 
-# === SET GUIDED MODE FIRST ===
 print("[INFO] Setting GUIDED mode...")
-print(f"[DEBUG] Sending GUIDED mode to system {master.target_system}, component {master.target_component}")
-master.set_mode('GUIDED')
-ack = master.recv_match(type='COMMAND_ACK', blocking=True)
-print(f"[INFO] GUIDED mode ACK: {ack}")
-if hasattr(ack, 'result'):
-    print(f"[DEBUG] GUIDED mode ACK result: {ack.result}")
-time.sleep(10)  # Short delay to ensure mode change
-
-# === ARM DRONE AFTER GUIDED ===
+mode_guided = master.mode_mapping()['GUIDED']
 master.mav.command_long_send(
     master.target_system,
     master.target_component,
-    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-    0,  # 0=disarm, 1=arm
-    1, 0, 0, 0, 0, 0, 0, 0
+    mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+    0,
+    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+    mode_guided, 0, 0, 0, 0, 0
 )
-print("[INFO] Drone armed, ready for takeoff")
-time.sleep(5)  # Short delay to ensure arming
+ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+print(f"[INFO] GUIDED mode ACK: {ack}")
 
-# === TAKEOFF ===
-print("[INFO] Sending takeoff command...")
-print(f"[DEBUG] Sending TAKEOFF to system {master.target_system}, component {master.target_component}")
-master.mav.command_long_send(master.target_system,master.target_component,mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 15, 15)  # param7=15m altitude, param8=0
+time.sleep(2)
 
-# Wait for takeoff confirmation and print ACK
-ack = master.recv_match(type='COMMAND_ACK', blocking=True)
-print(f"[INFO] Takeoff ACK: {ack}")
-if hasattr(ack, 'result'):
-    print(f"[DEBUG] Takeoff ACK result: {ack.result}")
-print("[INFO] Takeoff command sent, drone ascending...")
+print("[INFO] Arming drone...")
+master.mav.command_long_send(
+    master.target_system, master.target_component,
+    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+    0, 1, 0, 0, 0, 0, 0, 0
+)
+ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+print(f"[INFO] ARM ACK: {ack}")
 
-# === HELPER FUNCTION: Send velocity ===
+time.sleep(2)
+
+
+print(f"[INFO] Sending takeoff command to {TARGET_ALTITUDE}m...")
+master.mav.command_long_send(
+    master.target_system, master.target_component,
+    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+    0, 0, 0, 0, 0, 0, 0, TARGET_ALTITUDE
+)
+ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+print(f"[INFO] TAKEOFF ACK: {ack}")
+
+
+print("[INFO] Waiting to reach target altitude...")
+while True:
+    msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=5)
+    if msg:
+        current_alt = msg.relative_alt / 1000.0  # mm to m
+        print(f"[DEBUG] Current Altitude: {current_alt:.2f}m")
+        if abs(current_alt - TARGET_ALTITUDE) < 0.5:
+            print(f"[INFO] Target altitude {TARGET_ALTITUDE}m reached.")
+            break
+    else:
+        print("[WARN] No altitude data, retrying...")
+
+
 def send_velocity(vx, vy, vz, yaw_rate):
+    elapsed = (time.time() - boot_time) * 1e3  
     master.mav.set_position_target_local_ned_send(
-        0,  # time_boot_ms
+        int(elapsed),
         master.target_system,
         master.target_component,
-        mavutil.mavlink.MAV_FRAME_BODY_NED, int(0b0000111111000111), 0, 0, 0, vx, vy, vz, 0, 0, 0, 0, 0)
+        mavutil.mavlink.MAV_FRAME_BODY_NED,
+        0b0000111111000111,  
+        0, 0, 0,             
+        vx, vy, vz,          
+        0, 0, 0,             
+        0, yaw_rate          
+    )
 
-# === OPEN CAMERA STREAM ===
+
 print("[INFO] Opening camera stream...")
 cap = cv2.VideoCapture(CAMERA_SOURCE)
 if not cap.isOpened():
     raise IOError("Cannot open camera/stream")
 
-# === MAIN LOOP ===
-print("[INFO] Starting detection and control loop...")
+
+print("[INFO] Starting target tracking loop...")
 try:
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("[WARN] No frame received from camera")
+            print("[WARN] No frame received")
+            send_velocity(0, 0, 0, 0)  
             continue
 
-        # Run YOLOv5 detection
+        
         results = model(frame)
-        detections = results.pandas().xyxy[0]  # Pandas DataFrame
+        detections = results.pandas().xyxy[0]
 
-        # Find target class
         target = detections[detections['name'] == TARGET_CLASS]
         if not target.empty:
-            # Take the largest detection (closest object)
             target = target.iloc[target['area'].idxmax()]
-
-            # Bounding box center
             x_center = (target['xmin'] + target['xmax']) / 2
             y_center = (target['ymin'] + target['ymax']) / 2
+            bbox_area = (target['xmax'] - target['xmin']) * (target['ymax'] - target['ymin'])
 
-            # Frame center
             frame_h, frame_w, _ = frame.shape
-            cx = frame_w / 2
-            cy = frame_h / 2
+            cx, cy = frame_w / 2, frame_h / 2
 
-            # Calculate offsets
-            offset_x = x_center - cx
-            offset_y = y_center - cy
+            offset_x = (x_center - cx) / cx  # [-1, 1]
+            offset_y = (y_center - cy) / cy  # [-1, 1]
 
-            # Normalize offsets
-            norm_x = offset_x / cx  # [-1, 1]
-            norm_y = offset_y / cy  # [-1, 1]
+            yaw_rate = -offset_x * KP_YAW
+            vz = offset_y * KP_ALT
 
-            # Simple proportional controller
-            yaw_rate = -norm_x * KP_YAW  # Yaw to center
-            vz = norm_y * KP_ALT         # Up/down to center
-            vx = SPEED                   # Forward
+            AREA_FAR = 0.05 * frame_w * frame_h
+            AREA_CLOSE = 0.2 * frame_w * frame_h
+            if bbox_area < AREA_FAR:
+                vx = SPEED
+            elif bbox_area > AREA_CLOSE:
+                vx = -SPEED / 2
+            else:
+                vx = 0
 
-            # Send MAVLink command
+            print(f"[DEBUG] vx={vx:.2f}, vz={vz:.2f}, yaw_rate={yaw_rate:.2f}")
+
             send_velocity(vx, 0, vz, yaw_rate)
 
-            # Draw detection
             label = f"{target['name']} {target['confidence']:.2f}"
             cv2.rectangle(frame, (int(target['xmin']), int(target['ymin'])),
                           (int(target['xmax']), int(target['ymax'])), (0,255,0), 2)
             cv2.putText(frame, label, (int(target['xmin']), int(target['ymin'])-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
         else:
-            # No target found, hover
+            print("[INFO] Target lost - hovering")
             send_velocity(0, 0, 0, 0)
 
-        # Show frame
         cv2.imshow('YOLOv5 Detection', np.squeeze(results.render()))
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -150,12 +177,12 @@ except KeyboardInterrupt:
     print("\n[INFO] Interrupted by user")
 
 finally:
-    print("[INFO] Landing and closing...")
-    send_velocity(0, 0, 0, 0)  # Stop movement
+    print("[INFO] Landing...")
+    send_velocity(0, 0, 0, 0)
     master.mav.command_long_send(
-        master.target_system,
-        master.target_component,
+        master.target_system, master.target_component,
         mavutil.mavlink.MAV_CMD_NAV_LAND,
-        0, 0, 0, 0, 0, 0, 0, 0)
+        0, 0, 0, 0, 0, 0, 0, 0
+    )
     cap.release()
     cv2.destroyAllWindows()
