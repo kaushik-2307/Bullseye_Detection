@@ -19,12 +19,12 @@ MAVLINK_SIGN_KEY = b'supersecurekey1234'
 SIGNING_ID = 1
 
 
-print("Loading YOLOv5 model...")
+print("Loading YOLOv5 model")
 model = torch.hub.load('ultralytics/yolov5', 'custom', YOLO_MODEL)
 model.conf = 0.4
 
 
-print("Connecting to MAVLink (MAVLink2)...")
+print("Connecting to MAVLink")
 boot_time = time.time()
 master = mavutil.mavlink_connection(
     MAVLINK_CONNECTION, baud=115200, source_system=1, mavlink20=True
@@ -50,7 +50,7 @@ def arm_and_takeoff():
     )
     master.recv_match(type='COMMAND_ACK', blocking=True)
 
-    print("Arming...")
+    print("Arm")
     master.mav.command_long_send(
         master.target_system, master.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
@@ -88,7 +88,7 @@ def send_velocity(vx, vy, vz, yaw_rate):
     print(f"vx={vx:.2f}, vy=0, vz={vz:.2f}, yaw_rate={yaw_rate:.2f}")
 
 
-print(" Opening camera...")
+print(" Opening camera")
 cap = cv2.VideoCapture(CAMERA_SOURCE)
 if not cap.isOpened():
     raise IOError("Cannot open camera/stream")
