@@ -9,7 +9,7 @@ YOLO_MODEL = 'C:/Users/nayak/Documents/Bullseye_Detection/yolov5/runs/train/bull
 TARGET_CLASS = 'hotspot-y5zB'   
 CAMERA_SOURCE = 0
 MAVLINK_CONNECTION = 'tcp:127.0.0.1:5762'
-SPEED = 3                      
+SPEED = 1                     
 KP_YAW = 1.0                   
 KP_ALT = 0.7                   
 KP_VX = 0.5                    
@@ -85,7 +85,7 @@ def send_velocity(vx, vy, vz, yaw_rate):
         0, 0, 0,
         0, yaw_rate
     )
-    print(f"vx={vx:.2f}, vy=0, vz={vz:.2f}, yaw_rate={yaw_rate:.2f}")
+    print(f"vx={vx:.2f}, vy={vy:.2f}, vz={vz:.2f}, yaw_rate={yaw_rate:.2f}")
 
 
 print(" Opening camera")
@@ -132,9 +132,9 @@ try:
             else:
                 vy = 0
 
-            print(f"Moving: vx={vx:.2f}, vy={vy:.2f}, vz={vz:.2f}")
-            send_velocity(vx, vy, vz, 0)
-
+            yaw_rate = 0  # No yaw movement
+            print(f"[INFO] Moving: vx={vx:.2f}, vy={vy:.2f}, vz={vz:.2f}, yaw_rate={yaw_rate:.2f}")
+            send_velocity(vx, vy, vz, yaw_rate)
             
             label = f"{target['name']} {target['confidence']:.2f}"
             cv2.rectangle(frame, (int(target['xmin']), int(target['ymin'])),
@@ -162,4 +162,3 @@ finally:
     )
     cap.release()
     cv2.destroyAllWindows()
-2
