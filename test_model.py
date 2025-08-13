@@ -4,7 +4,7 @@ from pymavlink import mavutil
 
 # Load model
 model = torch.hub.load('ultralytics/yolov5', 'custom',
-                       path='D:/Bullseye_Detection/yolov5/runs/train/helipad22/weights/best.pt',
+                       path='D:/Bullseye_Detection/yolov5/runs/train/helipadnew2/weights/best.pt',
                        force_reload=True)
 model.conf = 0.4  # confidence threshold
 
