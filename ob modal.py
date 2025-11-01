@@ -1,13 +1,13 @@
 import cv2
 import numpy as np
 import time
-import tensorflow as tf  # or import tflite_runtime.interpreter as tflite
+import tflite  # or import tflite_runtime.interpreter as tflite
 
 # Path to your YOLOv8 TFLite model
-TFLITE_MODEL_PATH = "C:/Users/Bharath N/OneDrive/Documents/ob2/SAE object detection.v1i.yolov8/best.tflite"
+TFLITE_MODEL_PATH = "best_float16"
 
 # Load TFLite model
-interpreter = tf.lite.Interpreter(model_path=TFLITE_MODEL_PATH)
+interpreter = tflite.Interpreter(model_path=TFLITE_MODEL_PATH)
 interpreter.allocate_tensors()
 
 input_details = interpreter.get_input_details()
