@@ -37,32 +37,81 @@ master = None
 def arm_and_takeoff():
     """Arm and take off to target altitude"""
     print("Setting GUIDED mode...")
-    mode_guided = master.mode_mapping()['GUIDED']
+    # Ensure mode mapping contains GUIDED
+    mapping = master.mode_mapping()
+    if 'GUIDED' not in mapping:
+        print(f"[WARN] GUIDED mode not in mapping: {mapping}")
+    mode_guided = mapping.get('GUIDED', 4)
+
+    # send mode change
     master.mav.command_long_send(
         master.target_system, master.target_component,
         mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
         mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        mode_guided, 0, 0, 0, 0, 0
+        int(mode_guided), 0, 0, 0, 0, 0
     )
-    master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+    ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+    print(f"Mode change ACK: {ack}")
     time.sleep(1)
-    
+
     print("Arming...")
     master.mav.command_long_send(
         master.target_system, master.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
         1, 0, 0, 0, 0, 0, 0
     )
-    master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
-    time.sleep(2)
-    
+    ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+    print(f"Arm command ACK: {ack}")
+
+    # wait up to 10s for motors to report armed via heartbeat
+    armed = False
+    for _ in range(20):
+        hb = master.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
+        if hb is None:
+            continue
+        base_mode = getattr(hb, 'base_mode', 0)
+        # MAV_MODE_FLAG_SAFETY_ARMED == 128
+        if base_mode & 128:
+            armed = True
+            break
+    if not armed:
+        print("[ERROR] Vehicle did not arm within timeout. Check safety, pre-arm checks, or permissions.")
+        return
+    print("Vehicle armed")
+
     print(f"Taking off to {TARGET_ALTITUDE}m...")
     master.mav.command_long_send(
         master.target_system, master.target_component,
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,
-        0, 0, 0, 0, 0, 0, TARGET_ALTITUDE
+        0, 0, 0, 0, 0, 0, float(TARGET_ALTITUDE)
     )
-    master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+    ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+    print(f"Takeoff command ACK: {ack}")
+
+    # Optionally wait and confirm altitude increase via GLOBAL_POSITION_INT or VFR_HUD
+    print("Waiting for climb...")
+    climbed = False
+    for _ in range(30):
+        gps = master.recv_match(type=['GLOBAL_POSITION_INT', 'VFR_HUD'], blocking=True, timeout=1)
+        if gps is None:
+            continue
+        if gps.get_type() == 'GLOBAL_POSITION_INT':
+            # alt in millimeters
+            alt_m = getattr(gps, 'relative_alt', None)
+            if alt_m is not None:
+                alt_m = alt_m / 1000.0
+                if alt_m >= TARGET_ALTITUDE * 0.5:
+                    climbed = True
+                    break
+        elif gps.get_type() == 'VFR_HUD':
+            alt = getattr(gps, 'alt', None)
+            if alt is not None and alt >= TARGET_ALTITUDE * 0.5:
+                climbed = True
+                break
+    if climbed:
+        print("Takeoff confirmed (altitude increasing)")
+    else:
+        print("Takeoff not confirmed - vehicle may still be climbing or telemetry unavailable")
 
 def send_velocity_command():
     """Send velocity command at fixed rate"""
@@ -119,10 +168,26 @@ def return_to_launch():
 def main():
     global master, boot_time
     
-    print("Loading YOLOv5 model...")
+    print("Loading YOLOv5 model (forcing CPU)...")
+    # Force CPU-only execution
+    device = torch.device('cpu')
+    if torch.cuda.is_available():
+        print("⚠️ CUDA is available but will be ignored - forcing CPU for model.")
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    # Disable cuDNN to avoid any accidental GPU acceleration
+    try:
+        torch.backends.cudnn.enabled = False
+    except Exception:
+        pass
+
     model = torch.hub.load('ultralytics/yolov5', 'custom', YOLO_MODEL)
     model.conf = 0.7
-    model.cpu().float()
+    model.to(device)
+    model.eval()
+    model.float()
     torch.set_num_threads(4)
     
     print("Connecting to MAVLink...")
@@ -152,7 +217,9 @@ def main():
                 set_velocity(0, 0, 0, 0)
                 continue
             
-            results = model(frame)
+            # Run inference on CPU without gradients
+            with torch.no_grad():
+                results = model(frame)
             detections = results.pandas().xyxy[0]
             
             target = detections[detections['name'] == TARGET_CLASS]
@@ -218,10 +285,24 @@ def main():
                 print("[WARNING] Target not found - hovering")
                 set_velocity(0, 0, 0, 0)
             
-            cv2.imshow('YOLOv5 Helipad Detection', frame)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            # Try to display frame. Some OpenCV builds (headless) lack GUI support
+            # and will raise cv2.error on imshow/destroyAllWindows. In that case
+            # save the latest frame to disk so you can inspect it remotely.
+            try:
+                cv2.imshow('YOLOv5 Helipad Detection', frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            except cv2.error as e:
+                # Headless environment: fall back to writing the latest frame to disk
+                try:
+                    out_path = 'latest_frame.jpg'
+                    cv2.imwrite(out_path, frame)
+                    print(f"[HEADLESS] OpenCV has no GUI support. Saved latest frame to {out_path}.")
+                except Exception as ex:
+                    print("[HEADLESS] Failed to write frame to disk:", ex)
+                # Avoid busy-looping too fast when no GUI is available
+                time.sleep(0.05)
+                continue
     
     except KeyboardInterrupt:
         print("\nInterrupted by user")
@@ -235,8 +316,16 @@ def main():
             mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0,
             0, 0, 0, 0, 0, 0, 0
         )
-        cap.release()
-        cv2.destroyAllWindows()
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            # Ignore destroyAllWindows errors in headless builds
+            pass
 
 if __name__ == "__main__":
     main()

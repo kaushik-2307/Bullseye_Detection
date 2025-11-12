@@ -48,7 +48,7 @@ master.mav.command_long_send(
 )
 master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
 
-
+time.sleep(10)  # Wait for takeoff to complete
 
 # Hover
 print(f"Hovering for {HOVER_TIME}s...")
