@@ -81,38 +81,14 @@ def arm_and_takeoff():
 
     print(f"Taking off to {TARGET_ALTITUDE}m...")
     master.mav.command_long_send(
-        master.target_system, master.target_component,
-        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,
-        0, 0, 0, 0, 0, 0, float(TARGET_ALTITUDE)
-    )
+    master.target_system, master.target_component,
+    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,
+    0, 0, 0, 0, 0, 0, TARGET_ALTITUDE
+)
     ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
     print(f"Takeoff command ACK: {ack}")
-
-    # Optionally wait and confirm altitude increase via GLOBAL_POSITION_INT or VFR_HUD
-    print("Waiting for climb...")
-    climbed = False
-    for _ in range(30):
-        gps = master.recv_match(type=['GLOBAL_POSITION_INT', 'VFR_HUD'], blocking=True, timeout=1)
-        if gps is None:
-            continue
-        if gps.get_type() == 'GLOBAL_POSITION_INT':
-            # alt in millimeters
-            alt_m = getattr(gps, 'relative_alt', None)
-            if alt_m is not None:
-                alt_m = alt_m / 1000.0
-                if alt_m >= TARGET_ALTITUDE * 0.5:
-                    climbed = True
-                    break
-        elif gps.get_type() == 'VFR_HUD':
-            alt = getattr(gps, 'alt', None)
-            if alt is not None and alt >= TARGET_ALTITUDE * 0.5:
-                climbed = True
-                break
-    if climbed:
-        print("Takeoff confirmed (altitude increasing)")
-    else:
-        print("Takeoff not confirmed - vehicle may still be climbing or telemetry unavailable")
-
+    print("Waiting for takeoff to complete...")
+    time.sleep(10)
 def send_velocity_command():
     """Send velocity command at fixed rate"""
     with command_lock:
