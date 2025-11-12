@@ -25,7 +25,7 @@ CONF_THRESH = 0.25
 IOU_THRESH = 0.45
 
 # Point this to your TFLite model (update filename if needed)
-MODEL_PATH = r"best_8_float16.tflite"  # change as needed
+MODEL_PATH = r"/home/pi/models/best_8_float16.tflite"  # change as needed
 
 # Display and model input size (square)
 DISPLAY_SIZE = 640          # screen and model input are 640x640
@@ -420,4 +420,62 @@ try:
 
             # draw bbox & label
             cv2.rectangle(zoomed_display, (x1, y1), (x2, y2), BOX_COLOR, BOX_THICKNESS)
-            if
+            if tid in track_to_class:
+                cls_id = track_to_class[tid]
+                cls_name = NAMES[cls_id] if 0 <= cls_id < len(NAMES) else f"Cls{cls_id}"
+                label = f"{cls_name} ID:{tid}"
+            else:
+                label = f"ID:{tid}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, LABEL_FONT_THICK)
+            lx, ly = x1, max(0, y1 - th - 6)
+            cv2.rectangle(zoomed_display, (lx, ly), (lx + tw + 8, ly + th + 6), BOX_COLOR, -1)
+            cv2.putText(zoomed_display, label, (lx + 4, ly + th + 2), cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, (10,10,10), LABEL_FONT_THICK, cv2.LINE_AA)
+
+        # draw counting line
+        cv2.line(zoomed_display, (0, LINE_Y), (DISPLAY_SIZE, LINE_Y), LINE_COLOR, LINE_THICKNESS)
+
+        # overlay info panel
+        now = time.time()
+        fps = 1.0 / (now - prev) if (now - prev) > 0 else 0
+        prev = now
+        draw_info_panel(zoomed_display, ZOOM_FACTOR, fps)
+
+        # show
+        cv2.imshow(WINDOW_TITLE, zoomed_display)
+
+        frame_idx += 1
+
+        # key handling
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == ord('Q'):
+            break
+        elif key == ord('+') or key == ord('='):
+            ZOOM_FACTOR = min(ZOOM_MAX, round(ZOOM_FACTOR + ZOOM_STEP, 2))
+        elif key == ord('-') or key == ord('_'):
+            ZOOM_FACTOR = max(ZOOM_MIN, round(ZOOM_FACTOR - ZOOM_STEP, 2))
+        elif key == ord('z'):
+            ZOOM_FACTOR = 1.0
+
+except KeyboardInterrupt:
+    pass
+except Exception:
+    print("Runtime error:")
+    traceback.print_exc()
+finally:
+    try:
+        picam2.stop()
+    except Exception:
+        pass
+    cv2.destroyAllWindows()
+
+    # Final counts printed in terminal (professional summary)
+    print("\nFINAL COUNTS (unique tracks that crossed the line downward):")
+    total = 0
+    if class_counts:
+        for cid in sorted(class_counts.keys()):
+            print(f"  {NAMES[cid]}: {class_counts[cid]}")
+            total += class_counts[cid]
+    else:
+        print("  None")
+    print(f"Total unique crossing tracks: {total}")
+    print("Done.")
