@@ -1,0 +1,423 @@
+# yolo_tflite_bytetrack_picam2.py
+import time
+import traceback
+from collections import Counter
+
+import cv2
+import numpy as np
+
+from cjm_byte_track.core import BYTETracker
+
+# Picamera2 for Raspberry Pi 5
+from picamera2 import Picamera2, Preview
+
+# -------------------------
+# CONFIG
+# -------------------------
+NAMES = [
+    'Bicycle', 'Fire-extinguisher', 'ball-basketball', 'ball-football',
+    'ball-volleyball', 'barrel', 'can', 'cardboard', 'cone-queuemanager cone',
+    'cone-sportscone', 'cone-trafficcone', 'drum', 'gunnybag', 'jerrycan',
+    'lifeguard tube', 'mannequin', 'motorbike', 'scooter', 'watercans'
+]
+
+CONF_THRESH = 0.25
+IOU_THRESH = 0.45
+
+# Point this to your TFLite model (update filename if needed)
+MODEL_PATH = r"best_8_float16.tflite"  # change as needed
+
+# Display and model input size (square)
+DISPLAY_SIZE = 640          # screen and model input are 640x640
+MODEL_INPUT_SIZE = 640
+
+# Zoom (digital). Start at 1.0 (no zoom). Adjust with '+' and '-' keys.
+ZOOM_FACTOR = 1.0
+ZOOM_STEP = 0.1
+ZOOM_MIN = 1.0
+ZOOM_MAX = 4.0
+
+# Counting line fraction (70% down)
+LINE_FRACTION = 0.7
+
+# Visual style
+INFO_BG_ALPHA = 0.65
+INFO_BG_COLOR = (20, 20, 20)
+INFO_TEXT_COLOR = (220, 220, 220)
+BOX_COLOR = (0, 200, 0)
+LINE_COLOR = (0, 0, 220)
+LINE_THICKNESS = 2
+BOX_THICKNESS = 2
+LABEL_FONT_SCALE = 0.5
+LABEL_FONT_THICK = 1
+
+WINDOW_TITLE = "YOLOv8 TFLite — 640x640 (PiCam2)"
+
+# -------------------------
+# Safe Interpreter import (internal -> fallback)
+# -------------------------
+print("Starting — loading TFLite Interpreter...")
+
+try:
+    from tensorflow.lite.python.interpreter import Interpreter as _TFInterpreterInternal
+    Interpreter = _TFInterpreterInternal
+    print("Using internal TensorFlow Lite Interpreter")
+except ImportError:
+    try:
+        import tensorflow as tf
+        Interpreter = tf.lite.Interpreter
+        print("Using public tf.lite.Interpreter")
+    except Exception:
+        traceback.print_exc()
+        raise SystemExit("TensorFlow not available. Install tensorflow or tflite_runtime.")
+
+# -------------------------
+# Load TFLite model
+# -------------------------
+try:
+    interpreter = Interpreter(model_path=MODEL_PATH, num_threads=4)
+    interpreter.allocate_tensors()
+except Exception:
+    traceback.print_exc()
+    raise SystemExit("Failed to load/allocate the TFLite model. Check model path and runtime compatibility.")
+
+input_details = interpreter.get_input_details()[0]
+output_details = interpreter.get_output_details()
+
+input_shape = input_details.get('shape', None)
+input_dtype = input_details.get('dtype', np.float32)
+input_quant = input_details.get('quantization', (0.0, 0))
+
+print(f"Model: {MODEL_PATH}")
+print(f"Input shape: {input_shape}, dtype: {input_dtype}, quant: {input_quant}")
+print(f"Classes: {len(NAMES)}")
+print("Controls: + - z reset | q quit (press Q in window or Ctrl-C in terminal)\n")
+
+# Determine model layout (best-effort)
+if input_shape is not None and len(input_shape) == 4 and input_shape[1] == 3:
+    MODEL_LAYOUT = 'NCHW'
+else:
+    MODEL_LAYOUT = 'NHWC'
+
+# -------------------------
+# Picamera2 setup (Pi 5)
+# -------------------------
+picam2 = Picamera2()
+
+# Choose a preview/config resolution that's at least DISPLAY_SIZE square.
+# Many Pi cameras default to 1920x1080 or 1280x720; choose a safe value.
+# We'll configure a preview with RGB888 output.
+preview_config = picam2.create_preview_configuration({"size": (1280, 720)}, raw=False)
+picam2.configure(preview_config)
+picam2.start()
+time.sleep(0.3)  # let camera warm up
+
+# -------------------------
+# Helper utilities & preprocess
+# -------------------------
+LINE_Y = int(DISPLAY_SIZE * LINE_FRACTION)
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-np.clip(x, -88, 88)))
+
+def dequantize_if_needed(arr, quant_params):
+    scale, zp = quant_params if quant_params is not None else (0.0, 0)
+    if arr.dtype in (np.uint8, np.int8) and scale and scale != 0:
+        return (arr.astype(np.float32) - zp) * scale
+    if arr.dtype == np.float16:
+        return arr.astype(np.float32)
+    return arr.astype(np.float32)
+
+def center_square_crop(frame):
+    h, w = frame.shape[:2]
+    side = min(h, w)
+    cx, cy = w // 2, h // 2
+    x1 = cx - side // 2
+    y1 = cy - side // 2
+    return frame[y1:y1+side, x1:x1+side]
+
+def apply_digital_zoom(square_frame, zoom_factor, out_size=DISPLAY_SIZE):
+    h = square_frame.shape[0]
+    if zoom_factor <= 1.0:
+        cropped = square_frame
+    else:
+        r = int(h / (2.0 * zoom_factor))
+        cx = h // 2
+        cy = h // 2
+        x1 = max(0, cx - r)
+        y1 = max(0, cy - r)
+        x2 = min(h, cx + r)
+        y2 = min(h, cy + r)
+        cropped = square_frame[y1:y2, x1:x2]
+    resized = cv2.resize(cropped, (out_size, out_size), interpolation=cv2.INTER_LINEAR)
+    return resized
+
+def preprocess_frame_for_model(frame_rgb, size=MODEL_INPUT_SIZE):
+    img = cv2.resize(frame_rgb, (size, size)).astype(np.float32) / 255.0
+    if MODEL_LAYOUT == 'NHWC':
+        inp = img[None, :, :, :]
+    else:
+        inp = np.transpose(img, (2, 0, 1))[None, ...]
+    if input_dtype in (np.uint8, np.int8):
+        scale, zp = input_quant if input_quant is not None else (0.0, 0)
+        if scale and scale != 0:
+            q = np.round(inp / scale + zp).astype(input_dtype)
+        else:
+            q = np.clip(np.round(inp * 255.0), np.iinfo(input_dtype).min, np.iinfo(input_dtype).max).astype(input_dtype)
+        return q, (DISPLAY_SIZE, DISPLAY_SIZE)
+    else:
+        return inp.astype(np.float32), (DISPLAY_SIZE, DISPLAY_SIZE)
+
+def nms(boxes, scores, iou_threshold=0.45):
+    if not boxes:
+        return []
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+    x1, y1, x2, y2 = boxes[:,0], boxes[:,1], boxes[:,2], boxes[:,3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    return keep
+
+def postprocess_yolov8(tflite_outputs, original_shape):
+    if len(tflite_outputs) == 1:
+        output = tflite_outputs[0]
+    else:
+        output = max(tflite_outputs, key=lambda x: x.size)
+
+    output = dequantize_if_needed(output, (0.0, 0))
+
+    if len(output.shape) == 3:
+        if output.shape[1] < output.shape[2]:
+            output = output[0].T
+        else:
+            output = output[0]
+    elif len(output.shape) == 2:
+        output = output
+    else:
+        output = output.reshape(-1, output.shape[-1])
+
+    h_orig, w_orig = original_shape
+    sx = w_orig / float(MODEL_INPUT_SIZE)
+    sy = h_orig / float(MODEL_INPUT_SIZE)
+
+    boxes, scores, class_ids = [], [], []
+    num_features = output.shape[1]
+    has_obj = (num_features == (4 + 1 + len(NAMES)))
+
+    for p in output:
+        if not np.all(np.isfinite(p)):
+            continue
+
+        if has_obj:
+            obj = sigmoid(p[4])
+            if obj < CONF_THRESH:
+                continue
+            class_probs = sigmoid(p[5:])
+            cid = int(np.argmax(class_probs))
+            conf = float(obj * class_probs[cid])
+        else:
+            class_part = p[4:]
+            cid = int(np.argmax(class_part))
+            conf = float(class_part[cid])
+
+        if conf < CONF_THRESH or cid >= len(NAMES):
+            continue
+
+        cx, cy, bw, bh = float(p[0]), float(p[1]), float(p[2]), float(p[3])
+        max_val = max(cx, cy, bw, bh)
+
+        if max_val <= 1.5:
+            cx_px = cx * MODEL_INPUT_SIZE
+            cy_px = cy * MODEL_INPUT_SIZE
+            bw_px = bw * MODEL_INPUT_SIZE
+            bh_px = bh * MODEL_INPUT_SIZE
+        elif max_val <= MODEL_INPUT_SIZE + 1.0:
+            cx_px = cx
+            cy_px = cy
+            bw_px = bw
+            bh_px = bh
+        else:
+            cx_px = cx
+            cy_px = cy
+            bw_px = bw
+            bh_px = bh
+
+        if max_val > MODEL_INPUT_SIZE + 1.0:
+            x1 = cx_px - bw_px / 2.0
+            y1 = cy_px - bh_px / 2.0
+            x2 = cx_px + bw_px / 2.0
+            y2 = cy_px + bh_px / 2.0
+        else:
+            x1 = (cx_px - bw_px / 2.0) * sx
+            y1 = (cy_px - bh_px / 2.0) * sy
+            x2 = (cx_px + bw_px / 2.0) * sx
+            y2 = (cy_px + bh_px / 2.0) * sy
+
+        x1 = max(0.0, min(x1, w_orig - 1.0))
+        y1 = max(0.0, min(y1, h_orig - 1.0))
+        x2 = max(0.0, min(x2, w_orig - 1.0))
+        y2 = max(0.0, min(y2, h_orig - 1.0))
+
+        boxes.append([x1, y1, x2, y2])
+        scores.append(conf)
+        class_ids.append(cid)
+
+    keep = nms(boxes, scores, IOU_THRESH)
+    dets = []
+    for i in keep:
+        x1, y1, x2, y2 = boxes[i]
+        dets.append({
+            "box": [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))],
+            "conf": float(scores[i]),
+            "class": int(class_ids[i])
+        })
+    return dets
+
+# -------------------------
+# Tracker & counting state
+# -------------------------
+tracker = BYTETracker(track_thresh=0.5, track_buffer=30, match_thresh=0.8, frame_rate=30)
+track_to_class = {}
+counted_tracks = set()
+pending_crosses = set()
+track_last_bottom = {}
+class_counts = Counter()
+
+# -------------------------
+# Professional overlay helpers
+# -------------------------
+def draw_info_panel(img, zoom, fps):
+    panel_w, panel_h = 180, 50
+    x0, y0 = 8, 8
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), INFO_BG_COLOR, -1)
+    cv2.addWeighted(overlay, INFO_BG_ALPHA, img, 1 - INFO_BG_ALPHA, 0, img)
+    text1 = f"Zoom: {zoom:.1f}x"
+    text2 = f"FPS: {fps:.1f}"
+    cv2.putText(img, text1, (x0 + 12, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, INFO_TEXT_COLOR, 1, cv2.LINE_AA)
+    cv2.putText(img, text2, (x0 + 12, y0 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.50, INFO_TEXT_COLOR, 1, cv2.LINE_AA)
+
+# -------------------------
+# Main loop (Picamera2)
+# -------------------------
+prev = time.time()
+frame_idx = 0
+print("=" * 60)
+print("YOLOv8 TFLite — PiCam2 Professional Display (640x640)")
+print("Controls: + - z reset | q quit (press Q on window or Ctrl-C in terminal)")
+print("Counts will be printed in the terminal when you quit.")
+print("=" * 60)
+
+cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(WINDOW_TITLE, DISPLAY_SIZE, DISPLAY_SIZE)
+
+try:
+    while True:
+        # Capture from Picamera2 (RGB array)
+        frame = picam2.capture_array()  # returns RGB by default
+        if frame is None:
+            continue
+
+        # convert to BGR for OpenCV drawing
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        # crop to center square and apply digital zoom, result is BGR 640x640
+        square = center_square_crop(frame_bgr)
+        zoomed_display = apply_digital_zoom(square, ZOOM_FACTOR, out_size=DISPLAY_SIZE)
+
+        # prepare model input (convert zoomed_display to RGB)
+        frame_rgb = cv2.cvtColor(zoomed_display, cv2.COLOR_BGR2RGB)
+        img_input, orig_shape = preprocess_frame_for_model(frame_rgb, MODEL_INPUT_SIZE)
+
+        # run interpreter
+        input_index = input_details['index']
+        if input_dtype in (np.uint8, np.int8):
+            interpreter.set_tensor(input_index, img_input)
+        else:
+            interpreter.set_tensor(input_index, img_input.astype(np.float32))
+        interpreter.invoke()
+
+        outputs = []
+        for od in output_details:
+            out = interpreter.get_tensor(od['index'])
+            outputs.append(dequantize_if_needed(out, od.get('quantization', (0.0, 0))))
+
+        # postprocess -> detections in DISPLAY_SIZE coords
+        dets = postprocess_yolov8(outputs, orig_shape)
+
+        # ByteTrack update (DISPLAY_SIZE coords)
+        if dets:
+            detections = np.array([[d['box'][0], d['box'][1], d['box'][2], d['box'][3], d['conf']] for d in dets], dtype=np.float32)
+        else:
+            detections = np.empty((0, 5), dtype=np.float32)
+
+        online_targets = tracker.update(
+            output_results=detections,
+            img_info=(DISPLAY_SIZE, DISPLAY_SIZE),
+            img_size=(DISPLAY_SIZE, DISPLAY_SIZE)
+        )
+
+        # process tracks: assign classes, count, draw boxes (label shows name when available)
+        for track in online_targets:
+            tlwh = track.tlwh
+            tid = track.track_id
+            x1, y1 = int(tlwh[0]), int(tlwh[1])
+            x2, y2 = int(tlwh[0] + tlwh[2]), int(tlwh[1] + tlwh[3])
+            bottom_y = y2
+
+            prev_bottom = track_last_bottom.get(tid, None)
+            track_last_bottom[tid] = bottom_y
+
+            # assign class if possible (IoU matching)
+            if tid not in track_to_class:
+                best_iou, best_cls = 0.0, None
+                for d in dets:
+                    dx1, dy1, dx2, dy2 = d['box']
+                    inter_x1 = max(x1, dx1)
+                    inter_y1 = max(y1, dy1)
+                    inter_x2 = min(x2, dx2)
+                    inter_y2 = min(y2, dy2)
+                    inter_w = max(0, inter_x2 - inter_x1)
+                    inter_h = max(0, inter_y2 - inter_y1)
+                    inter = inter_w * inter_h
+                    area_t = max(0, x2 - x1) * max(0, y2 - y1)
+                    area_d = max(0, dx2 - dx1) * max(0, dy2 - dy1)
+                    denom = (area_t + area_d - inter + 1e-9)
+                    iou = inter / denom if denom > 0 else 0.0
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_cls = d['class']
+                if best_iou >= 0.25 and best_cls is not None:
+                    track_to_class[tid] = best_cls
+                    if tid in pending_crosses and tid not in counted_tracks:
+                        counted_tracks.add(tid)
+                        class_counts[best_cls] += 1
+                        pending_crosses.discard(tid)
+
+            # crossing detection (downwards)
+            if prev_bottom is not None and prev_bottom < LINE_Y and bottom_y >= LINE_Y:
+                if tid not in counted_tracks:
+                    if tid in track_to_class:
+                        cls_id = track_to_class[tid]
+                        counted_tracks.add(tid)
+                        class_counts[cls_id] += 1
+                    else:
+                        pending_crosses.add(tid)
+
+            # draw bbox & label
+            cv2.rectangle(zoomed_display, (x1, y1), (x2, y2), BOX_COLOR, BOX_THICKNESS)
+            if
